@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+python-dotenv==1.0.1
+loguru==0.7.2
+rapidfuzz==3.9.7
+openpyxl==3.1.5
