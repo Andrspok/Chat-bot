@@ -1,14 +1,9 @@
 # ============================================
 # Chat-bot v2 — SINGLE FILE (bot.py)
-# Version: v8.3 (2025-09-25)
-# База: v8.2 (стабильная)
-# Новое в v8.3:
-#  - Верификация по номеру телефона (request_contact) + белый список номеров/ролей из .env
-#  - SQLite: параллельно с JSONL. Схема совместима для будущей миграции на MS SQL
-#  - Ролевые проверки для действий в группах (исполнители по группам, диспетчеры, админы)
-#  - Интерактивное меню и кнопки для основных действий
-#  - Статусы в UI — на русском (в БД/экспорте поля оставляем англ)
-#  - Подготовлены таблицы/поля для инкрементальной выгрузки в 1С (по last_export_ts)
+# Version: v8.2 (2025-09-24)
+# База: v8.1
+# FIX: Экспорт Excel — сериализация сложных полей (dict/list/tuple) в листе "events".
+# Команды экспорта: /export_excel, /export_csv
 # ============================================
 
 import os
@@ -17,10 +12,9 @@ import csv
 import json
 import time
 import uuid
-import sqlite3
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Set
-from datetime import datetime, UTC, timedelta
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, UTC, timedelta  # timezone-aware UTC
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -33,9 +27,6 @@ from telegram import (
     InlineKeyboardMarkup,
     Message,
     InputFile,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -48,7 +39,7 @@ from telegram.ext import (
 )
 
 # ============================================
-# ПУТИ / ЛОГИ / ENV
+# ИНФРА / ЛОГИ / .ENV
 # ============================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # ...\Chat-bot
@@ -56,8 +47,6 @@ DATA_DIR = PROJECT_ROOT / "data"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_PATH = DATA_DIR / "bot.db"  # SQLite база рядом с JSONL
 
 def setup_logging(logs_dir: Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -89,7 +78,7 @@ def load_env(project_root: Path) -> None:
         load_dotenv()
 
 # ============================================
-# JSONL ПЕРСИСТ (оставляем как раньше)
+# ПЕРСИСТ (JSONL) + ОПЕРАТИВНОЕ СОСТОЯНИЕ
 # ============================================
 
 TICKETS_FILE = DATA_DIR / "tickets.jsonl"
@@ -101,329 +90,29 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
         json.dump(record, f, ensure_ascii=False)
         f.write("\n")
 
-def save_ticket_event_jsonl(event: Dict[str, Any]) -> None:
+def save_ticket_event(event: Dict[str, Any]) -> None:
     _append_jsonl(TICKETS_FILE, event)
 
-def save_feedback_jsonl(event: Dict[str, Any]) -> None:
+def save_feedback(event: Dict[str, Any]) -> None:
     _append_jsonl(FEEDBACK_FILE, event)
 
-# ============================================
-# SQLITE: СХЕМА И УТИЛИТЫ
-# Схема спроектирована так, чтобы было легко переехать на MS SQL
-# ============================================
+# Оперативное хранилище заявок до БД
+TICKETS: Dict[str, Dict[str, Any]] = {}  # ticket_id -> ticket
+PENDING_REJECT_COMMENT_BY_USER: Dict[int, str] = {}  # executor_id -> ticket_id
 
-SQL_SCHEMA = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS users (
-    telegram_user_id INTEGER PRIMARY KEY,
-    phone_e164 TEXT NOT NULL,
-    full_name TEXT,
-    roles TEXT NOT NULL,            -- CSV: author,executor:СВС,executor:СГЭ,executor:ССТ,dispatcher,admin
-    verified_at TEXT NOT NULL,      -- ISO UTC
-    active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS tickets (
-    ticket_id TEXT PRIMARY KEY,
-    author_id INTEGER,
-    author_name TEXT,
-    group_name TEXT,                -- СВС/СГЭ/ССТ
-    category TEXT,
-    text TEXT,
-    created_ts TEXT,                -- ISO UTC
-    queued_ts TEXT,
-    accepted_ts TEXT,
-    rejected_ts TEXT,
-    closed_ts TEXT,
-    final_status TEXT,              -- created|queued|accepted|rejected|closed
-    executor_id INTEGER,
-    executor_name TEXT,
-    reject_comment TEXT,
-    group_chat_id INTEGER,
-    group_message_id INTEGER,
-    updated_ts TEXT                 -- ISO UTC (для инкрементальной выгрузки)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticket_id TEXT NOT NULL,
-    event TEXT NOT NULL,            -- new_text|queued_to_group|accepted|rejected|closed_by_executor
-    ts_utc TEXT NOT NULL,           -- ISO UTC
-    author_id INTEGER,
-    executor_id INTEGER,
-    group_name TEXT,
-    category TEXT,
-    payload_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS sync_state (
-    system TEXT PRIMARY KEY,        -- '1C', 'BI', ...
-    last_export_ts TEXT             -- ISO UTC
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_ticket_ts ON ticket_events(ticket_id, ts_utc);
-CREATE INDEX IF NOT EXISTS idx_tickets_updated ON tickets(updated_ts);
-"""
-
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def db_init() -> None:
-    with db() as conn:
-        conn.executescript(SQL_SCHEMA)
-
-def iso_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
-
-def db_upsert_user(telegram_user_id: int, phone: str, full_name: str, roles_csv: str) -> None:
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO users(telegram_user_id, phone_e164, full_name, roles, verified_at, active)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(telegram_user_id) DO UPDATE SET
-                phone_e164=excluded.phone_e164,
-                full_name=excluded.full_name,
-                roles=excluded.roles,
-                verified_at=excluded.verified_at,
-                active=1
-        """, (telegram_user_id, phone, full_name, roles_csv, iso_now()))
-
-def db_get_user_roles(telegram_user_id: int) -> Set[str]:
-    with db() as conn:
-        r = conn.execute("SELECT roles, active FROM users WHERE telegram_user_id=?", (telegram_user_id,)).fetchone()
-        if not r or r["active"] != 1:
-            return set()
-        roles_csv = r["roles"] or ""
-        return {x.strip() for x in roles_csv.split(",") if x.strip()}
-
-def db_insert_event(ev: Dict[str, Any]) -> None:
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO ticket_events(ticket_id, event, ts_utc, author_id, executor_id, group_name, category, payload_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ev.get("ticket_id") or ev.get("id"),
-            ev["event"],
-            ev.get("ts") or iso_now(),
-            ev.get("submitter_id"),
-            ev.get("executor_id"),
-            (ev.get("classification") or {}).get("group") or ev.get("group"),
-            (ev.get("classification") or {}).get("category") or ev.get("category"),
-            json.dumps(ev, ensure_ascii=False)
-        ))
-
-def db_upsert_ticket_snapshot(t: Dict[str, Any]) -> None:
-    # соберём поля снимка
-    now = iso_now()
-    row = {
-        "ticket_id": t["id"],
-        "author_id": t.get("submitter_id"),
-        "author_name": t.get("submitter_name"),
-        "group_name": (t.get("classification") or {}).get("group"),
-        "category": (t.get("classification") or {}).get("category"),
-        "text": t.get("text"),
-        "created_ts": None,
-        "queued_ts": None,
-        "accepted_ts": None,
-        "rejected_ts": None,
-        "closed_ts": None,
-        "final_status": t.get("status"),
-        "executor_id": t.get("executor_id"),
-        "executor_name": t.get("executor_name"),
-        "reject_comment": t.get("reject_comment"),
-        "group_chat_id": t.get("group_chat_id"),
-        "group_message_id": t.get("group_message_id"),
-        "updated_ts": now,
-    }
-    # Вытащим уже известные таймстемпы из событий (минимально, по состоянию в памяти)
-    # Здесь мы не знаем точных ts, поэтому финально агрегируем из events, если нужно
-    with db() as conn:
-        # если запись есть — берём существующие значения и обновляем только изменившиеся
-        existed = conn.execute("SELECT * FROM tickets WHERE ticket_id=?", (t["id"],)).fetchone()
-        if existed:
-            for k in ("author_id","author_name","group_name","category","text","executor_id","executor_name",
-                      "reject_comment","group_chat_id","group_message_id"):
-                if row[k] is None:
-                    row[k] = existed[k]
-            # финальный статус перезаписываем всегда (может поменяться)
-            conn.execute("""
-                UPDATE tickets SET
-                    author_id=?, author_name=?, group_name=?, category=?, text=?,
-                    final_status=?, executor_id=?, executor_name=?, reject_comment=?,
-                    group_chat_id=?, group_message_id=?, updated_ts=?
-                WHERE ticket_id=?
-            """, (
-                row["author_id"], row["author_name"], row["group_name"], row["category"], row["text"],
-                row["final_status"], row["executor_id"], row["executor_name"], row["reject_comment"],
-                row["group_chat_id"], row["group_message_id"], row["updated_ts"],
-                row["ticket_id"]
-            ))
-        else:
-            conn.execute("""
-                INSERT INTO tickets(ticket_id, author_id, author_name, group_name, category, text,
-                                    created_ts, queued_ts, accepted_ts, rejected_ts, closed_ts,
-                                    final_status, executor_id, executor_name, reject_comment,
-                                    group_chat_id, group_message_id, updated_ts)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                row["ticket_id"], row["author_id"], row["author_name"], row["group_name"], row["category"], row["text"],
-                row["created_ts"], row["queued_ts"], row["accepted_ts"], row["rejected_ts"], row["closed_ts"],
-                row["final_status"], row["executor_id"], row["executor_name"], row["reject_comment"],
-                row["group_chat_id"], row["group_message_id"], row["updated_ts"]
-            ))
-
-def db_touch_ticket_timestamp(ticket_id: str, field: str, ts: Optional[str] = None) -> None:
-    val = ts or iso_now()
-    with db() as conn:
-        conn.execute(f"UPDATE tickets SET {field}=?, updated_ts=? WHERE ticket_id=?", (val, iso_now(), ticket_id))
-
-def db_fetch_tickets_rows() -> List[Dict[str, Any]]:
-    with db() as conn:
-        cur = conn.execute("""
-            SELECT ticket_id, group_name AS "group", category,
-                   author_id, author_name, executor_id, executor_name,
-                   created_ts, queued_ts, accepted_ts, rejected_ts, closed_ts,
-                   final_status, reject_comment
-            FROM tickets ORDER BY COALESCE(created_ts, updated_ts) ASC
-        """)
-        return [dict(r) for r in cur.fetchall()]
-
-def db_update_from_events() -> None:
-    """
-    Страховочный сбор таймстемпов из событий (на случай рестартов бота).
-    Преобразуем ticket_events → tickets.*_ts и final_status.
-    """
-    with db() as conn:
-        # Соберём минимальные/максимальные ts по типам событий
-        cur = conn.execute("""
-            SELECT ticket_id,
-                   MIN(CASE WHEN event='new_text' THEN ts_utc END) AS created_ts,
-                   MIN(CASE WHEN event='queued_to_group' THEN ts_utc END) AS queued_ts,
-                   MIN(CASE WHEN event='accepted' THEN ts_utc END) AS accepted_ts,
-                   MIN(CASE WHEN event='rejected' THEN ts_utc END) AS rejected_ts,
-                   MIN(CASE WHEN event='closed_by_executor' THEN ts_utc END) AS closed_ts
-            FROM ticket_events
-            GROUP BY ticket_id
-        """)
-        rows = cur.fetchall()
-        for r in rows:
-            final_status = None
-            if r["closed_ts"]:
-                final_status = "closed"
-            elif r["rejected_ts"]:
-                final_status = "rejected"
-            elif r["accepted_ts"]:
-                final_status = "accepted"
-            elif r["queued_ts"]:
-                final_status = "queued"
-            elif r["created_ts"]:
-                final_status = "created"
-            if final_status:
-                conn.execute("""
-                    UPDATE tickets SET created_ts=COALESCE(created_ts, ?),
-                                       queued_ts=COALESCE(queued_ts, ?),
-                                       accepted_ts=COALESCE(accepted_ts, ?),
-                                       rejected_ts=COALESCE(rejected_ts, ?),
-                                       closed_ts=COALESCE(closed_ts, ?),
-                                       final_status=?,
-                                       updated_ts=?
-                    WHERE ticket_id=?
-                """, (r["created_ts"], r["queued_ts"], r["accepted_ts"], r["rejected_ts"], r["closed_ts"],
-                      final_status, iso_now(), r["ticket_id"]))
-
-def db_get_last_export_ts(system: str) -> Optional[str]:
-    with db() as conn:
-        r = conn.execute("SELECT last_export_ts FROM sync_state WHERE system=?", (system,)).fetchone()
-        return r["last_export_ts"] if r and r["last_export_ts"] else None
-
-def db_set_last_export_ts(system: str, ts: str) -> None:
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO sync_state(system, last_export_ts) VALUES(?, ?)
-            ON CONFLICT(system) DO UPDATE SET last_export_ts=excluded.last_export_ts
-        """, (system, ts))
-
-def db_fetch_tickets_since(ts_iso: Optional[str]) -> List[Dict[str, Any]]:
-    query = """
-        SELECT ticket_id, group_name AS "group", category,
-               author_id, author_name, executor_id, executor_name,
-               created_ts, queued_ts, accepted_ts, rejected_ts, closed_ts,
-               final_status, reject_comment, updated_ts
-        FROM tickets
-        WHERE (? IS NULL OR updated_ts > ?)
-        ORDER BY updated_ts ASC
-    """
-    with db() as conn:
-        cur = conn.execute(query, (ts_iso, ts_iso))
-        return [dict(r) for r in cur.fetchall()]
+def new_ticket_id() -> str:
+    return uuid.uuid4().hex[:8].upper()
 
 # ============================================
-# РОЛИ / ВЕРИФИКАЦИЯ ПО ТЕЛЕФОНУ
+# ПОЛЕЗНЫЕ УТИЛИТЫ
 # ============================================
 
-def normalize_phone_e164(raw: str) -> str:
-    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
-    if not digits:
-        return ""
-    # Простейшая нормализация под РФ: 8 -> 7
-    if digits.startswith("8"):
-        digits = "7" + digits[1:]
-    if not digits.startswith("7") and not digits.startswith("1") and not digits.startswith("3") and not digits.startswith("4") and not digits.startswith("5") and not digits.startswith("2"):
-        # если это не международный формат, попробуем как есть
-        pass
-    return "+" + digits
+def user_link_html(user_id: int, name: str | None) -> str:
+    safe = html_escape(name or "пользователь", quote=False)
+    return f'<a href="tg://user?id={user_id}">{safe}</a>'
 
-def load_phone_roles_from_env() -> Dict[str, Set[str]]:
-    """
-    Читаем списки телефонов из .env и собираем карту phone_e164 -> set(roles).
-    Роли: author,executor:СВС,executor:СГЭ,executor:ССТ,dispatcher,admin
-    """
-    mapping: Dict[str, Set[str]] = {}
-    def add_list(env_key: str, role: str):
-        raw = os.getenv(env_key, "")
-        for item in raw.split(","):
-            p = normalize_phone_e164(item.strip())
-            if not p:
-                continue
-            mapping.setdefault(p, set()).add(role)
-
-    add_list("PHONES_AUTHORS", "author")
-    add_list("PHONES_EXECUTORS_SVS", "executor:СВС")
-    add_list("PHONES_EXECUTORS_SGE", "executor:СГЭ")
-    add_list("PHONES_EXECUTORS_SST", "executor:ССТ")
-    add_list("PHONES_DISPATCHERS", "dispatcher")
-    add_list("PHONES_ADMINS", "admin")
-    return mapping
-
-PHONE_ROLES_MAP: Dict[str, Set[str]] = {}  # заполним в main()
-
-def roles_csv(roles: Set[str]) -> str:
-    return ",".join(sorted(roles))
-
-def has_role(telegram_user_id: int, role_prefix: str) -> bool:
-    roles = db_get_user_roles(telegram_user_id)
-    return any(r == role_prefix or r.startswith(role_prefix) for r in roles)
-
-def ensure_verified_author(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        u = update.effective_user
-        if not u:
-            return
-        roles = db_get_user_roles(u.id)
-        if "author" not in roles and "admin" not in roles and "dispatcher" not in roles:
-            await update.message.reply_text(
-                "Чтобы отправлять заявки, подтвердите номер телефона в личке с ботом.\nНажмите /verify"
-            )
-            return
-        return await func(update, context)
-    return wrapper
-
-# ============================================
-# АУДИТ-КАНАЛ
-# ============================================
+def get_admins() -> set[int]:
+    return {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 GROUP_TO_ENV = {"СВС": "CHAT_ID_SVS", "СГЭ": "CHAT_ID_SGE", "ССТ": "CHAT_ID_SST"}
 
@@ -462,7 +151,7 @@ async def audit_log(bot, text: str) -> None:
         logger.exception("audit_log failed")
 
 # ============================================
-# ЭВРИСТИКИ (как в v8.2)
+# ЭВРИСТИКИ УТО — из вашей таблицы
 # ============================================
 
 GROUP_CATEGORIES: Dict[str, List[Dict[str, Any]]] = {
@@ -513,10 +202,6 @@ GROUP_CATEGORIES: Dict[str, List[Dict[str, Any]]] = {
     ],
 }
 
-# ============================================
-# КЛАССИФИКАЦИЯ
-# ============================================
-
 def _count_hits(text: str, patterns: List[str]) -> int:
     t = (text or "").lower()
     return sum(1 for p in patterns if p.lower() in t)
@@ -540,26 +225,8 @@ def classify(text: str) -> Dict[str, Any]:
     return {"group": best_group, "category": best_category, "confidence": 0.0, "hits": hits}
 
 # ============================================
-# РУССКИЕ СТАТУСЫ (для UI)
+# РЕНДЕР/КНОПКИ ДЛЯ ГРУППОВОГО СООБЩЕНИЯ
 # ============================================
-
-STATUS_RU = {
-    "created": "новая",
-    "queued": "на отправке",
-    "accepted": "в работе",
-    "rejected": "отклонена",
-    "closed": "закрыта",
-}
-def status_ru(code: str) -> str:
-    return STATUS_RU.get(code, code or "-")
-
-# ============================================
-# РЕНДЕР/КНОПКИ
-# ============================================
-
-def user_link_html(user_id: int, name: str | None) -> str:
-    safe = html_escape(name or "пользователь", quote=False)
-    return f'<a href="tg://user?id={user_id}">{safe}</a>'
 
 def ticket_group_text(t: Dict[str, Any]) -> str:
     submit_link = user_link_html(t["submitter_id"], t.get("submitter_name"))
@@ -570,7 +237,7 @@ def ticket_group_text(t: Dict[str, Any]) -> str:
         "",
         body,
         "",
-        f"Статус: <b>{html_escape(status_ru(t['status']).upper(), quote=False)}</b>",
+        f"Статус: <b>{html_escape(t['status'].upper(), quote=False)}</b>",
     ]
     if t.get("executor_id"):
         parts.append(f"Исполнитель: {user_link_html(t['executor_id'], t.get('executor_name'))}")
@@ -596,22 +263,6 @@ def kb_after_accept(ticket_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📱 Подтвердить номер", callback_data="ui:verify")],
-            [InlineKeyboardButton("📊 Экспорт Excel", callback_data="ui:export_excel"),
-             InlineKeyboardButton("🧾 Экспорт CSV", callback_data="ui:export_csv")],
-            [InlineKeyboardButton("ℹ️ Помощь", callback_data="ui:help")],
-        ]
-    )
-
-def verify_reply_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Подтвердить номер (отправить контакт)", request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
-
 # ============================================
 # ОТПРАВКА В ЧАТ ГРУППЫ
 # ============================================
@@ -631,44 +282,28 @@ async def send_to_group(context_bot, t: Dict[str, Any]) -> Optional[Message]:
         return None
 
 # ============================================
-# КОМАНДЫ И МЕНЮ
+# КОМАНДЫ
 # ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
-            "Привет! Я помогаю отправлять заявки в УТО (СВС/СГЭ/ССТ).\n"
-            "1) Сначала подтвердите номер телефона — это нужно для доступа.\n"
-            "2) Потом просто напишите текст заявки — я определю группу и отправлю её исполнителям.",
-            reply_markup=main_menu_kb()
-        )
-        await update.message.reply_text(
-            "Нажмите кнопку ниже, чтобы отправить боту ваш номер:",
-            reply_markup=verify_reply_kb()
-        )
-    else:
-        await update.message.reply_text("Бот активен. Для помощи — /help")
-
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Меню:", reply_markup=main_menu_kb())
+    await update.message.reply_text(
+        "Привет! Напишите заявку — я определю группу (СВС/СГЭ/ССТ) и категорию и отправлю в чат группы. "
+        "Исполнитель сможет принять/отклонить/завершить; при завершении заявка сразу закрывается (вам придёт уведомление)."
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Команды:\n"
         "/start — приветствие\n"
-        "/menu — интерактивное меню\n"
-        "/verify — подтвердить номер телефона\n"
+        "/help — помощь\n"
         "/whoami — показать ваш user_id и текущий chat_id\n"
         "/echo_chat_id_any — вернуть chat_id текущего чата (диагностика)\n"
         "/echo_chat_id — то же, но только для ADMIN_IDS\n"
         "/debug_env — показать chat_id групп и аудит-канала (ADMIN)\n"
         "/export_excel — выгрузить Excel со статистикой заявок\n"
         "/export_csv — выгрузить CSV со статистикой заявок\n"
-        "В личке: напишите текст — и подтвердите отправку заявки в группу."
+        "Просто пришлите текст заявки."
     )
-
-def get_admins() -> set[int]:
-    return {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,53 +331,18 @@ async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audit = get_audit_chat_id()
     await update.message.reply_text(f"CHAT_ID_SVS={svs}\nCHAT_ID_SGE={sge}\nCHAT_ID_SST={sst}\nAUDIT_CHAT_ID={audit}")
 
-async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Нажмите кнопку ниже, чтобы отправить боту ваш номер телефона:",
-        reply_markup=verify_reply_kb()
-    )
-
-# ============================================
-# ОБРАБОТКА КОНТАКТА (ВЕРИФИКАЦИЯ)
-# ============================================
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.contact:
-        return
-    c = update.message.contact
-    user = update.effective_user
-    if not user:
-        return
-    phone = normalize_phone_e164(c.phone_number)
-    roles = PHONE_ROLES_MAP.get(phone, set())
-    if not roles:
-        await update.message.reply_text(
-            f"Номер {phone} не найден в списке доступа. Обратитесь к администратору."
-        )
-        return
-    # Пользователь может иметь несколько ролей (author+executor:СВС, ...)
-    db_upsert_user(user.id, phone, user.full_name or "", roles_csv(roles))
-    await update.message.reply_text(
-        f"Готово! Номер подтверждён: {phone}\n"
-        f"Ваши роли: {', '.join(sorted(roles))}\n"
-        "Теперь можно отправлять заявки.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
 # ============================================
 # ПРИЁМ ТЕКСТА ОТ АВТОРА (классификация → подтверждение)
-# Только для верифицированных авторов/диспетчеров/админов
+# + защита: если от пользователя ожидается комментарий к отказу, это сообщение не считается новой заявкой
 # ============================================
 
 CONFIRM_CB = "ticket_confirm"
 REPORT_CB  = "ticket_report_mistake"
 
-@ensure_verified_author
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    # Если исполнитель должен написать комментарий к отказу — не создаём новую заявку
     user_id = update.effective_user.id if update.effective_user else None
     if user_id and PENDING_REJECT_COMMENT_BY_USER.get(user_id):
         return
@@ -756,7 +356,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         group = result.get("group", "Неопределено")
         category = result.get("category", "Другое")
 
-        t_id = uuid.uuid4().hex[:8].upper()
+        t_id = new_ticket_id()
         ticket = {
             "id": t_id,
             "submitter_id": u.id if u else None,
@@ -764,20 +364,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "submitter_chat_id": ch.id if ch else None,
             "text": text,
             "classification": result,
-            "status": "created",
+            "status": "new",
         }
         context.user_data["last_ticket"] = ticket
-
-        # JSONL + DB (event+snapshot)
-        event = {"event": "new_text", **ticket}
-        save_ticket_event_jsonl(event)
-        db_insert_event({"event": "new_text", **ticket})
-        db_upsert_ticket_snapshot(ticket)
-        db_touch_ticket_timestamp(t_id, "created_ts")
+        save_ticket_event({"event": "new_text", **ticket})
 
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Подтвердить отправку в группу", callback_data=CONFIRM_CB)],
+                [InlineKeyboardButton("Подтвердить", callback_data=CONFIRM_CB)],
                 [InlineKeyboardButton("Сообщить об ошибке", callback_data=REPORT_CB)],
             ]
         )
@@ -786,7 +380,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"• Группа-исполнитель: <b>{group}</b>\n"
             f"• Категория: <b>{category}</b>\n"
             f"• Номер заявки: <b>#{t_id}</b>\n\n"
-            "Если всё верно — подтвердите отправку в группу."
+            "Если всё верно — подтвердите. Если нет — сообщите об ошибке."
         )
         await update.message.reply_html(msg, reply_markup=kb)
 
@@ -798,18 +392,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Ошибка обработки заявки. Попробуйте ещё раз или /help.")
 
 # ============================================
-# EXPORT (как в v8.2, но из SQLite)
+# EXPORT: чтение событий и агрегация в таблицу
 # ============================================
-
-def _dur_str(delta: Optional[timedelta]) -> str:
-    if not delta:
-        return ""
-    total_sec = int(delta.total_seconds())
-    h, rem = divmod(total_sec, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
 
 def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
@@ -824,70 +408,195 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-def aggregate_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # В БД уже агрегировано; остаётся посчитать длительности
-    for r in rows:
-        created = _parse_iso(r.get("created_ts"))
-        queued  = _parse_iso(r.get("queued_ts"))
-        accepted= _parse_iso(r.get("accepted_ts"))
-        rejected= _parse_iso(r.get("rejected_ts"))
-        closed  = _parse_iso(r.get("closed_ts"))
+def _dur_str(delta: Optional[timedelta]) -> str:
+    if not delta:
+        return ""
+    total_sec = int(delta.total_seconds())
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def load_events() -> List[Dict[str, Any]]:
+    if not TICKETS_FILE.exists():
+        return []
+    events: List[Dict[str, Any]] = []
+    with TICKETS_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                events.append(obj)
+            except Exception:
+                logger.exception("Bad JSON line in tickets.jsonl")
+    def key_ts(e: Dict[str, Any]):
+        return _parse_iso(e.get("ts")) or datetime.min.replace(tzinfo=UTC)
+    events.sort(key=key_ts)
+    return events
+
+def aggregate_tickets(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    for e in events:
+        t_id = e.get("id") or e.get("ticket_id")
+        if not t_id:
+            continue
+        row = idx.setdefault(t_id, {
+            "ticket_id": t_id,
+            "group": (e.get("classification") or {}).get("group") or e.get("group"),
+            "category": (e.get("classification") or {}).get("category") or e.get("category"),
+            "author_id": e.get("submitter_id"),
+            "author_name": e.get("submitter_name"),
+            "executor_id": e.get("executor_id"),
+            "executor_name": e.get("executor_name"),
+            "created_ts": None,
+            "queued_ts": None,
+            "accepted_ts": None,
+            "rejected_ts": None,
+            "closed_ts": None,
+            "reject_comment": None,
+            "final_status": None,
+        })
+        ev = e.get("event")
+        ts = _parse_iso(e.get("ts"))
+        if ev == "new_text":
+            row["created_ts"] = row["created_ts"] or ts
+        elif ev == "queued_to_group":
+            row["queued_ts"] = row["queued_ts"] or ts
+        elif ev == "accepted":
+            row["accepted_ts"] = row["accepted_ts"] or ts
+            row["executor_id"] = e.get("executor_id") or row["executor_id"]
+            row["executor_name"] = e.get("executor_name") or row["executor_name"]
+        elif ev == "rejected":
+            row["rejected_ts"] = row["rejected_ts"] or ts
+            row["executor_id"] = e.get("executor_id") or row["executor_id"]
+            row["executor_name"] = e.get("executor_name") or row["executor_name"]
+            row["reject_comment"] = e.get("comment") or row["reject_comment"]
+            row["final_status"] = "rejected"
+        elif ev == "closed_by_executor":
+            row["closed_ts"] = row["closed_ts"] or ts
+            row["executor_id"] = e.get("executor_id") or row["executor_id"]
+            row["executor_name"] = e.get("executor_name") or row["executor_name"]
+            row["final_status"] = "closed"
+
+    for r in idx.values():
+        if not r["final_status"]:
+            if r["closed_ts"]:
+                r["final_status"] = "closed"
+            elif r["rejected_ts"]:
+                r["final_status"] = "rejected"
+            elif r["accepted_ts"]:
+                r["final_status"] = "accepted"
+            elif r["queued_ts"]:
+                r["final_status"] = "queued"
+            elif r["created_ts"]:
+                r["final_status"] = "created"
+            else:
+                r["final_status"] = "unknown"
+
+        created = r["created_ts"]
+        queued  = r["queued_ts"]
+        accepted= r["accepted_ts"]
+        rejected= r["rejected_ts"]
+        closed  = r["closed_ts"]
+
         r["time_to_queue"]   = _dur_str((queued - created) if (created and queued) else None)
         r["time_to_accept"]  = _dur_str((accepted - queued) if (accepted and queued) else None)
         r["time_in_progress"]= _dur_str((closed - accepted) if (closed and accepted) else None)
         end_ts = closed or rejected
         r["total_time"]      = _dur_str((end_ts - created) if (end_ts and created) else None)
+
+        for k in ("created_ts", "queued_ts", "accepted_ts", "rejected_ts", "closed_ts"):
+            v = r[k]
+            r[k] = v.isoformat(timespec="seconds") if isinstance(v, datetime) else ""
+
+    rows = list(idx.values())
+    rows.sort(key=lambda x: x["created_ts"] or "")
     return rows
 
-def _to_excel_cell(v: Any) -> Any:
-    if v is None:
-        return ""
-    if isinstance(v, (str, int, float, bool)):
-        return v
-    if isinstance(v, datetime):
-        return v.isoformat(timespec="seconds")
-    try:
-        return json.dumps(v, ensure_ascii=False)
-    except Exception:
-        return str(v)
-
 def write_csv(rows: List[Dict[str, Any]], path: Path) -> None:
-    header = [
-        "ticket_id","group","category","author_id","author_name","executor_id","executor_name",
-        "created_ts","queued_ts","accepted_ts","rejected_ts","closed_ts",
-        "time_to_queue","time_to_accept","time_in_progress","total_time","final_status","reject_comment"
-    ]
+    if not rows:
+        header = [
+            "ticket_id","group","category","author_id","author_name","executor_id","executor_name",
+            "created_ts","queued_ts","accepted_ts","rejected_ts","closed_ts",
+            "time_to_queue","time_to_accept","time_in_progress","total_time","final_status","reject_comment"
+        ]
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(header)
+        return
+
+    header = list(rows[0].keys())
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow(header)
         for r in rows:
             writer.writerow([r.get(k, "") for k in header])
 
-def write_xlsx(rows: List[Dict[str, Any]], path: Path) -> Tuple[bool, str]:
+# --- NEW: безопасное приведение к ячейке Excel
+def _to_excel_cell(v: Any) -> Any:
+    if v is None:
+        return ""
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, datetime):
+        # чтобы не путать часовые пояса, кладём строкой ISO
+        return v.isoformat(timespec="seconds")
+    # dict / list / tuple / set / прочее — сериализуем в JSON
+    try:
+        return json.dumps(v, ensure_ascii=False)
+    except Exception:
+        return str(v)
+
+def write_xlsx(rows: List[Dict[str, Any]], events: List[Dict[str, Any]], path: Path) -> Tuple[bool, str]:
     try:
         from openpyxl import Workbook
         from openpyxl.utils import get_column_letter
     except Exception:
         return False, "openpyxl не установлен"
+
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "tickets"
-    header = [
-        "ticket_id","group","category","author_id","author_name","executor_id","executor_name",
-        "created_ts","queued_ts","accepted_ts","rejected_ts","closed_ts",
-        "time_to_queue","time_to_accept","time_in_progress","total_time","final_status","reject_comment"
-    ]
+
+    # tickets sheet
+    if rows:
+        header = list(rows[0].keys())
+    else:
+        header = [
+            "ticket_id","group","category","author_id","author_name","executor_id","executor_name",
+            "created_ts","queued_ts","accepted_ts","rejected_ts","closed_ts",
+            "time_to_queue","time_to_accept","time_in_progress","total_time","final_status","reject_comment"
+        ]
     ws1.append(header)
     for r in rows:
         ws1.append([_to_excel_cell(r.get(k, "")) for k in header])
+
+    # events sheet (raw)
+    ws2 = wb.create_sheet(title="events")
+    if events:
+        eheader = sorted({k for e in events for k in e.keys()})
+    else:
+        eheader = ["ts","event","id","ticket_id","submitter_id","submitter_name","group","category","executor_id","executor_name","comment","text"]
+    ws2.append(eheader)
+    for e in events:
+        ws2.append([_to_excel_cell(e.get(k, "")) for k in eheader])
+
     # автоширина
-    for col_idx, _ in enumerate(ws1.iter_cols(min_row=1, max_row=1, values_only=True), start=1):
-        max_len = 0
-        for cell in ws1[get_column_letter(col_idx)]:
-            val = str(cell.value) if cell.value is not None else ""
-            max_len = max(max_len, len(val))
-        ws1.column_dimensions[get_column_letter(col_idx)].width = min(max(10, max_len + 2), 60)
-    # сохранение с ретраями
+    for ws in (ws1, ws2):
+        for col_idx, _ in enumerate(ws.iter_cols(min_row=1, max_row=1, values_only=True), start=1):
+            max_len = 0
+            for cell in ws[get_column_letter(col_idx)]:
+                try:
+                    val = str(cell.value) if cell.value is not None else ""
+                except Exception:
+                    val = ""
+                max_len = max(max_len, len(val))
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(10, max_len + 2), 60)
+
+    # устойчивое сохранение — 3 попытки
     for i in range(3):
         try:
             wb.save(path)
@@ -897,41 +606,64 @@ def write_xlsx(rows: List[Dict[str, Any]], path: Path) -> Tuple[bool, str]:
                 return False, f"save failed: {ex}"
             time.sleep(0.5)
 
+# ============================================
+# EXPORT: команды бота
+# ============================================
+
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = aggregate_rows(db_fetch_tickets_rows())
+    chat_id = update.effective_chat.id
+    events = load_events()
+    if not events:
+        await update.message.reply_text("Пока нет данных для экспорта (файл data/tickets.jsonl пуст).")
+        return
+
+    rows = aggregate_tickets(events)
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    out_path = DATA_DIR / f"tickets_{ts}.xlsx"
-    ok, msg = write_xlsx(rows, out_path)
+    out_path = DATA_DIR | f"tickets_{ts}.xlsx" if hasattr(DATA_DIR, "__or__") else DATA_DIR / f"tickets_{ts}.xlsx"
+
+    ok, msg = write_xlsx(rows, events, out_path)
     if not ok:
         await update.message.reply_text(f"Не удалось сформировать Excel: {msg}. Попробуйте /export_csv.")
         return
-    with out_path.open("rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=InputFile(f, filename=out_path.name),
-            caption=f"Экспорт заявок (актуально на {ts} UTC)."
-        )
-    await audit_log(context.bot, f"📊 <b>Экспорт Excel</b> отправлен ({out_path.name})")
+
+    try:
+        with out_path.open("rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(f, filename=out_path.name),
+                caption=f"Экспорт заявок (актуально на {ts} UTC)."
+            )
+        await audit_log(context.bot, f"📊 <b>Экспорт Excel</b> отправлен ({out_path.name})")
+    except Exception:
+        logger.exception("send excel failed")
+        await update.message.reply_text("Не удалось отправить Excel в чат. Проверьте логи.")
 
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = aggregate_rows(db_fetch_tickets_rows())
+    chat_id = update.effective_chat.id
+    events = load_events()
+    if not events:
+        await update.message.reply_text("Пока нет данных для экспорта (файл data/tickets.jsonl пуст).")
+        return
+
+    rows = aggregate_tickets(events)
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     out_path = DATA_DIR / f"tickets_{ts}.csv"
-    write_csv(rows, out_path)
-    with out_path.open("rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=InputFile(f, filename=out_path.name),
-            caption=f"Экспорт заявок (CSV, {ts} UTC)."
-        )
-    await audit_log(context.bot, f"📊 <b>Экспорт CSV</b> отправлен ({out_path.name})")
+    try:
+        write_csv(rows, out_path)
+        with out_path.open("rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(f, filename=out_path.name),
+                caption=f"Экспорт заявок (CSV, {ts} UTC)."
+            )
+        await audit_log(context.bot, f"📊 <b>Экспорт CSV</b> отправлен ({out_path.name})")
+    except Exception:
+        logger.exception("send csv failed")
+        await update.message.reply_text("Не удалось отправить CSV в чат. Проверьте логи.")
 
 # ============================================
 # CALLBACKS: подтверждение автора, действия исполнителя
 # ============================================
-
-PENDING_REJECT_COMMENT_BY_USER: Dict[int, str] = {}  # executor_id -> ticket_id
-TICKETS: Dict[str, Dict[str, Any]] = {}              # state in-memory (как и прежде)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -941,28 +673,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
 
     try:
-        # UI кнопки меню
-        if data == "ui:help":
-            await help_cmd(update, context)
-            await query.answer()
-            return
-        if data == "ui:export_excel":
-            await export_excel(update, context)
-            await query.answer()
-            return
-        if data == "ui:export_csv":
-            await export_csv(update, context)
-            await query.answer()
-            return
-        if data == "ui:verify":
-            if update.effective_chat.type == "private":
-                await verify_cmd(update, context)
-            else:
-                await query.message.reply_text("Подтверждение номера доступно только в личке с ботом: откройте диалог и нажмите /verify")
-            await query.answer()
-            return
-
-        # Логика заявок
         if data == CONFIRM_CB:
             ticket = context.user_data.get("last_ticket")
             if not ticket:
@@ -972,21 +682,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ticket["status"] = "queued"
             TICKETS[ticket["id"]] = ticket
 
-            # JSONL + DB
-            event = {"event": "queued_to_group", **ticket}
-            save_ticket_event_jsonl(event)
-            db_insert_event(event)
-            db_upsert_ticket_snapshot(ticket)
-            db_touch_ticket_timestamp(ticket["id"], "queued_ts")
-
             msg = await send_to_group(context.bot, ticket)
             if msg:
                 ticket["group_chat_id"] = msg.chat.id
                 ticket["group_message_id"] = msg.message_id
-
-                # Дообновим snapshot (chat ids)
-                db_upsert_ticket_snapshot(ticket)
-
+                save_ticket_event({"event": "queued_to_group", **ticket})
                 await query.answer("Заявка отправлена в группу.")
                 await query.edit_message_reply_markup(reply_markup=None)
                 await audit_log(context.bot, f"📤 <b>Отправлена в группу</b> #{ticket['id']} → {ticket['classification']['group']} / {ticket['classification']['category']}")
@@ -1002,7 +702,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
 
         elif data == REPORT_CB:
-            save_feedback_jsonl({"user_id": user.id if user else None, "feedback": "heuristics_mistake"})
+            save_feedback({"user_id": user.id if user else None, "feedback": "heuristics_mistake"})
             await query.answer("Принято. Улучшим правила.")
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
@@ -1024,14 +724,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             executor_id = user.id if user else None
             executor_name = user.full_name if user else None
 
-            # Проверка прав: роль исполнителя для нужной группы, либо dispatcher/admin
-            group = t["classification"]["group"]
-            roles = db_get_user_roles(executor_id)
-            allowed = ("admin" in roles or "dispatcher" in roles or (f"executor:{group}" in roles))
-            if not allowed:
-                await query.answer("Недостаточно прав. Нужна роль исполнителя этой группы (или диспетчер/админ).", show_alert=True)
-                return
-
             if query.message and (t.get("group_chat_id") != query.message.chat.id or t.get("group_message_id") != query.message.message_id):
                 await query.answer("Это сообщение уже устарело.")
                 return
@@ -1045,13 +737,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 t["executor_id"] = executor_id
                 t["executor_name"] = executor_name
                 TICKETS[t_id] = t
-
-                # JSONL + DB
-                save_ticket_event_jsonl({"event": "accepted", "ticket_id": t_id, "executor_id": executor_id, "executor_name": executor_name})
-                db_insert_event({"event": "accepted", "ticket_id": t_id, "executor_id": executor_id, "executor_name": executor_name,
-                                 "group": group, "category": t["classification"]["category"]})
-                db_upsert_ticket_snapshot(t)
-                db_touch_ticket_timestamp(t_id, "accepted_ts")
 
                 try:
                     await query.edit_message_text(
@@ -1071,6 +756,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     logger.exception("notify submitter accept failed")
 
+                save_ticket_event({"event": "accepted", "ticket_id": t_id, "executor_id": executor_id, "executor_name": executor_name})
                 await audit_log(context.bot, f"✅ <b>Принята в работу</b> #{t_id} исполнителем {user_link_html(executor_id, executor_name)}")
                 await query.answer("Взято в работу.")
 
@@ -1104,13 +790,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 t["closed"] = True
                 t["completed_by"] = executor_id
                 TICKETS[t_id] = t
-
-                # JSONL + DB
-                save_ticket_event_jsonl({"event": "closed_by_executor", "ticket_id": t_id, "executor_id": executor_id})
-                db_insert_event({"event": "closed_by_executor", "ticket_id": t_id, "executor_id": executor_id,
-                                 "group": group, "category": t["classification"]["category"]})
-                db_upsert_ticket_snapshot(t)
-                db_touch_ticket_timestamp(t_id, "closed_ts")
+                save_ticket_event({"event": "closed_by_executor", "ticket_id": t_id, "executor_id": executor_id})
 
                 try:
                     await query.edit_message_text(
@@ -1178,13 +858,7 @@ async def handle_text_reject_comment(update: Update, context: ContextTypes.DEFAU
     t["executor_name"] = u.full_name
     t["reject_comment"] = comment
     TICKETS[pending_tid] = t
-
-    # JSONL + DB
-    save_ticket_event_jsonl({"event": "rejected", "ticket_id": pending_tid, "executor_id": u.id, "comment": comment})
-    db_insert_event({"event": "rejected", "ticket_id": pending_tid, "executor_id": u.id,
-                     "group": t["classification"]["group"], "category": t["classification"]["category"], "comment": comment})
-    db_upsert_ticket_snapshot(t)
-    db_touch_ticket_timestamp(pending_tid, "rejected_ts")
+    save_ticket_event({"event": "rejected", "ticket_id": pending_tid, "executor_id": u.id, "comment": comment})
 
     try:
         await context.bot.edit_message_text(
@@ -1212,7 +886,7 @@ async def handle_text_reject_comment(update: Update, context: ContextTypes.DEFAU
     await audit_log(context.bot, f"❌ <b>Отклонена</b> #{pending_tid} исполнителем {user_link_html(u.id, u.full_name)}\nПричина: {html_escape(comment, quote=False)}")
 
 # ============================================
-# ГЛОБАЛЬНЫЕ ОШИБКИ
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
 # ============================================
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1227,21 +901,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # MAIN
 # ============================================
 
-async def on_contact_button_removed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тихо убираем клавиатуру, если пришёл не контакт (косметика)."""
-    if update.effective_chat.type == "private":
-        try:
-            await update.message.reply_text("Готово.", reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
-
 def main() -> None:
     setup_logging(LOGS_DIR)
     load_env(PROJECT_ROOT)
-    db_init()  # создаём/мигрируем SQLite
-
-    global PHONE_ROLES_MAP
-    PHONE_ROLES_MAP = load_phone_roles_from_env()
 
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -1251,16 +913,14 @@ def main() -> None:
         f"ENV chat ids: SVS={get_group_chat_id('СВС')} "
         f"SGE={get_group_chat_id('СГЭ')} "
         f"SST={get_group_chat_id('ССТ')} "
-        f"AUDIT={get_audit_chat_id()} | DB={DB_PATH}"
+        f"AUDIT={get_audit_chat_id()}"
     )
 
     app = ApplicationBuilder().token(token).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("verify", verify_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("echo_chat_id_any", echo_chat_id_any))
     app.add_handler(CommandHandler("echo_chat_id", echo_chat_id))  # admin-only
@@ -1268,15 +928,10 @@ def main() -> None:
     app.add_handler(CommandHandler("export_excel", export_excel))
     app.add_handler(CommandHandler("export_csv", export_csv))
 
-    # Текст от автора (в личке) — создаём заявки (только верифицированные)
+    # 1) Текст от автора (в личке) — создаём заявки
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Контакт для верификации (в личке)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.CONTACT, handle_contact))
-    # Если пользователь тыкнул не контакт после просьбы — просто уберём клавиатуру (необязательно)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Regex("^📱") & ~filters.CONTACT, on_contact_button_removed))
-
-    # Комментарий к отказу — из любого чата
+    # 2) Комментарий к отказу — из любого чата (ставим после приёма заявок)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_reject_comment))
 
     # Кнопки
@@ -1289,7 +944,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 
