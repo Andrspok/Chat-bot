@@ -1660,38 +1660,19 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not t:
             return
 
-        leader_comment = text or ""
-
-        # Кого вернуть исполнителем
-        pend_exec = (t.get("pending_reject") or {}).get("executor_id") or t.get("executor_id")
-        pend_exec_name = (t.get("pending_reject") or {}).get("executor_name") or t.get("executor_name")
-
-        # 1) Уведомляем исполнителя в личку
-        if pend_exec:
+        ex_id = (t.get("pending_reject") or {}).get("executor_id") or t.get("executor_id")
+        if ex_id:
             try:
                 await context.bot.send_message(
-                    chat_id=pend_exec,
+                    chat_id=ex_id,
                     text=(f"Руководитель отменил отклонение по заявке #{t_id}.\n"
-                          f"Комментарий: {html_escape(leader_comment or '-', False)}"),
+                          f"Комментарий: {html_escape(text or '-', False)}"),
                     parse_mode="HTML",
                 )
             except Exception:
                 logger.exception("notify executor cancel failed")
 
-        # 2) Публикуем комментарий руководителя в ГРУППОВОЙ ЧАТ (реплаем к карточке заявки)
-        try:
-            await context.bot.send_message(
-                chat_id=t["group_chat_id"],
-                reply_to_message_id=t["group_message_id"],
-                text=(f"↩️ Отмена отклонения по заявке #{t_id}.\n"
-                      f"Руководитель: {user_link_html(u.id, u.full_name)}\n"
-                      f"Комментарий: {html_escape(leader_comment or '-', False)}"),
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception("post leader cancel comment to group failed")
-
-        # 3) Возвращаем кнопки в карточке + снимаем флаг pending_reject
+        # возвращаем кнопки в групповое сообщение
         try:
             kb = kb_after_accept(t_id) if t.get("executor_id") else kb_initial(t_id)
             await context.bot.edit_message_text(
@@ -1704,25 +1685,18 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("edit group after leader cancel failed")
 
-        # 4) Автоматически закрепляем заявку за тем исполнителем, который изначально отправлял на отклонение
+        # закрепляем за изначальным исполнителем
+        pend_exec = (t.get("pending_reject") or {}).get("executor_id") or t.get("executor_id")
         if pend_exec:
             t["executor_id"] = pend_exec
-            t["executor_name"] = pend_exec_name
-
-        # Статус: «в работе»; если не стоял accepted_ts — проставим
-        t["status"] = "accepted"
-        if not t.get("accepted_ts"):
-            db_touch_ticket_timestamp(t_id, "accepted_ts")
-
-        # Отмечаем решение руководителя
+            # имя берём из исходной pending, если было
+            t["executor_name"] = (t.get("pending_reject") or {}).get("executor_name") or t.get("executor_name")
         t["leader_id"] = u.id
         t["leader_name"] = u.full_name
         t["leader_decision_ts"] = iso_now()
         t.pop("pending_reject", None)
-
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
-
         await audit_log(context.bot, f"↩️ Reject canceled by leader #{t_id}")
         return
 
@@ -1734,16 +1708,12 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CLARIFY_AUTHOR_WAIT.pop(reply_key, None)
         if not t:
             return
-
         answer = text
         t["clarify_answer"] = answer
         t["clarify_answered_ts"] = iso_now()
-        # Статус после ответа: если исполнитель уже есть — остаётся «в работе», иначе — «на отправке/в очереди»
-        #Тут логика UI уже отрисуется корректно ниже
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
 
-        # 1) Обновить карточку заявки (кнопки снова доступны)
         try:
             kb = kb_after_accept(t_id) if (t.get("status") == "accepted" or t.get("executor_id")) else kb_initial(t_id)
             await context.bot.edit_message_text(
@@ -1756,7 +1726,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("edit group after clarify answer failed")
 
-        # 2) Личное уведомление исполнителю (как было)
         try:
             await context.bot.send_message(
                 chat_id=info["executor_id"],
@@ -1765,17 +1734,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.exception("send clarify answer to executor failed")
-
-        # 3) Публикуем ОТВЕТ АВТОРА в ГРУППОВОЙ ЧАТ (реплаем на карточку заявки)
-        try:
-            await context.bot.send_message(
-                chat_id=t["group_chat_id"],
-                reply_to_message_id=t["group_message_id"],
-                text=(f"📩 Ответ автора по заявке #{t_id}:\n\n{html_escape(answer, False)}"),
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception("post clarify answer to group failed")
 
         await audit_log(context.bot, f"📩 Clarify answered #{t_id}")
         return
