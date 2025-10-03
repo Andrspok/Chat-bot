@@ -1,10 +1,8 @@
 # ============================================
 # Chat-bot v2 — SINGLE FILE (bot.py)
-# Version: v8.5.0 (2025-10-03)
-# База: 8.4.4 + Меню команд у строки ввода (role-aware setMyCommands)
+# Version: v8.4.4 (2025-10-01)
+# База: 8.4.3 + исправления доставки лидерам и рабочих кнопок на доп. сообщениях
 # ============================================
-
-# asdasd
 
 import os
 import io
@@ -31,9 +29,6 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    BotCommand,
-    BotCommandScopeChat,
-    BotCommandScopeDefault,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -834,7 +829,7 @@ async def post_leader_card_to_group(bot, t: Dict[str, Any], leader_text: str, re
         logger.exception("post_leader_card_to_group failed")
 
 # ============================================
-# КОМАНДЫ (HANDLERS)
+# КОМАНДЫ
 # ============================================
 
 def get_admins() -> set[int]:
@@ -848,9 +843,6 @@ def admin_only(func):
     return wrapper
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Установим персональное меню команд для этого пользователя/чата
-    await ensure_menu_for_chat(context, update.effective_user.id if update.effective_user else None, update.effective_chat.id)
-
     if update.effective_chat.type == "private":
         u = update.effective_user
         await update.message.reply_text(
@@ -914,60 +906,6 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Нажмите кнопку ниже, чтобы отправить боту ваш номер телефона:", reply_markup=verify_reply_kb())
 
 # ============================================
-# МЕНЮ КОМАНД (Telegram setMyCommands)
-# ============================================
-
-def build_default_commands() -> List[BotCommand]:
-    # Базовый набор, видимый до верификации и для всех по умолчанию
-    return [
-        BotCommand("start", "Приветствие и быстрый старт"),
-        BotCommand("help", "Справка по командам"),
-        BotCommand("menu", "Показать панель кнопок"),
-        BotCommand("panel", "Показать панель кнопок"),
-        BotCommand("verify", "Подтвердить номер телефона"),
-        BotCommand("whoami", "Показать user_id, chat_id и роли"),
-        BotCommand("echo_chat_id_any", "Показать chat_id текущего чата"),
-        BotCommand("export_excel", "Экспорт заявок в Excel"),
-        BotCommand("export_csv", "Экспорт заявок в CSV"),
-    ]
-
-def build_role_aware_commands(roles: Set[str]) -> List[BotCommand]:
-    cmds = build_default_commands()
-
-    # Админские — только если роль admin
-    if "admin" in roles:
-        cmds.extend(
-            [
-                BotCommand("echo_chat_id", "Показать chat_id (админ)"),
-                BotCommand("debug_env", "Показать chat_id групп/аудита (админ)"),
-            ]
-        )
-    return cmds
-
-async def ensure_menu_for_chat(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int], chat_id: int) -> None:
-    """
-    Выставляет меню команд для указанного чата:
-      - если известен user_id — команды под роли пользователя (scope=chat)
-      - иначе — дефолтные команды
-    """
-    try:
-        if user_id:
-            roles = db_get_user_roles(user_id)
-            cmds = build_role_aware_commands(roles) if roles else build_default_commands()
-            await context.bot.set_my_commands(commands=cmds, scope=BotCommandScopeChat(chat_id))
-        else:
-            await context.bot.set_my_commands(commands=build_default_commands(), scope=BotCommandScopeChat(chat_id))
-    except Exception:
-        logger.exception("ensure_menu_for_chat failed")
-
-async def set_default_commands(bot) -> None:
-    """Выставляем общий дефолтный набор команд (на всякий случай)."""
-    try:
-        await bot.set_my_commands(commands=build_default_commands(), scope=BotCommandScopeDefault())
-    except Exception:
-        logger.exception("set_default_commands failed")
-
-# ============================================
 # ВЕРИФИКАЦИЯ КОНТАКТА
 # ============================================
 
@@ -987,9 +925,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваши роли: {db_roles_ru(u.id)}",
         reply_markup=ReplyKeyboardRemove()
     )
-
-    # После верификации — обновляем меню команд под роли
-    await ensure_menu_for_chat(context, u.id, update.effective_chat.id)
 
 # ============================================
 # ПРИЁМ ТЕКСТА (новая заявка И/ИЛИ реплай-комментарий)
@@ -1803,11 +1738,6 @@ async def on_contact_button_removed(update: Update, context: ContextTypes.DEFAUL
         except Exception:
             pass
 
-async def _post_init(app):
-    # Выставляем дефолтный список команд для всех (на случай, если клиент смотрит default scope)
-    await set_default_commands(app.bot)
-    logger.info("Default commands set via setMyCommands (scope=default).")
-
 def main():
     setup_logging(LOGS_DIR)
     load_env(PROJECT_ROOT)
@@ -1829,9 +1759,6 @@ def main():
     )
 
     app = ApplicationBuilder().token(token).build()
-
-    # post_init — установим дефолтное меню команд
-    app.post_init = _post_init
 
     # Команды
     app.add_handler(CommandHandler("start", start))
