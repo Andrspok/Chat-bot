@@ -1,7 +1,9 @@
 # ============================================
 # Chat-bot v2 — SINGLE FILE (bot.py)
-# Version: v8.5.0 (2025-10-03)
-# База: 8.4.4 + Меню команд у строки ввода (role-aware setMyCommands)
+# Version: v8.5.1 (2025-10-03)
+# База: 8.5.0
+# - fix: leader cancel → return to queued with fresh buttons + leader comment
+# - fix: leader approve → close ticket + notify submitter
 # ============================================
 
 import os
@@ -327,7 +329,7 @@ def db_upsert_ticket_snapshot(t: Dict[str, Any]) -> None:
     }
     with db() as conn:
         _ensure_columns(conn, "tickets", TICKETS_EXPECTED_COLS)
-        existed = conn.execute("SELECT 1 FROM tickets WHERE ticket_id=?", (t["id"],)).fetchone()
+        existed = conn.execute("SELECT 1 FROM tickets WHERE ticket_id=?", (t["id"]),).fetchone()
         try:
             if existed:
                 _dynamic_update(conn, "tickets", row, "ticket_id", TICKETS_EXPECTED_COLS)
@@ -739,8 +741,6 @@ async def send_to_group(bot, t: Dict[str, Any]) -> Optional[Message]:
         return None
 
 def get_env_leader_ids(group: str) -> List[int]:
-    """Читаем прямые Telegram user_id руководителей из .env:
-       LEADER_IDS_SVS, LEADER_IDS_SGE, LEADER_IDS_SST  (через запятую)."""
     key = None
     if group == "СВС":
         key = "LEADER_IDS_SVS"
@@ -763,13 +763,9 @@ def get_env_leader_ids(group: str) -> List[int]:
     return ids
 
 async def send_to_leaders(bot, group: str, text: str, kb: InlineKeyboardMarkup) -> tuple[list[int], list[int]]:
-    """1) Пытаемся отправить руководителям из БД (verified).
-       2) Если никого не нашли/не доставили — пробуем список из .env (LEADER_IDS_*).
-       Возвращаем (delivered_ids, failed_ids)."""
     delivered: list[int] = []
     failed: list[int] = []
 
-    # 1) По ролям в БД
     db_leaders = db_find_users_by_role_prefix(f"leader:{group}") or []
     db_leader_ids = [r["telegram_user_id"] for r in db_leaders]
     if db_leader_ids:
@@ -790,7 +786,6 @@ async def send_to_leaders(bot, group: str, text: str, kb: InlineKeyboardMarkup) 
                 logger.exception(f"[leaders/DB] unexpected to {leader_id}: {type(e).__name__} | {e}")
                 failed.append(leader_id)
 
-    # 2) Если не доставили никому — пробуем LEADER_IDS_* из .env
     if not delivered:
         env_ids = get_env_leader_ids(group)
         if env_ids:
@@ -817,7 +812,6 @@ async def send_to_leaders(bot, group: str, text: str, kb: InlineKeyboardMarkup) 
     return delivered, failed
 
 async def post_leader_card_to_group(bot, t: Dict[str, Any], leader_text: str, reason_code: str) -> None:
-    """ФОЛБЭК: если лидерам в личку не доставилось — постим карточку в групповой чат (реплаем к заявке)."""
     try:
         kb = kb_leader_choose_group(t["id"]) if reason_code == "other_group" else kb_leader_approve_or_cancel(t["id"])
         await bot.send_message(
@@ -846,7 +840,6 @@ def admin_only(func):
     return wrapper
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Установим персональное меню команд для этого пользователя/чата
     await ensure_menu_for_chat(context, update.effective_user.id if update.effective_user else None, update.effective_chat.id)
 
     if update.effective_chat.type == "private":
@@ -868,7 +861,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — приветствие\n"
         "/menu, /panel — показать панель кнопок\n"
         "/verify — подтвердить номер телефона\n"
-        "/whoami — показать ваш user_id и chat_id\n"
+        "/whoami — показать user_id и chat_id\n"
         "/echo_chat_id_any — chat_id текущего чата (диагностика)\n"
         "/echo_chat_id — то же, но только для админов\n"
         "/debug_env — показать chat_id групп и аудит-канала (админ)\n"
@@ -916,7 +909,6 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 def build_default_commands() -> List[BotCommand]:
-    # Базовый набор, видимый до верификации и для всех по умолчанию
     return [
         BotCommand("start", "Приветствие и быстрый старт"),
         BotCommand("help", "Справка по командам"),
@@ -931,8 +923,6 @@ def build_default_commands() -> List[BotCommand]:
 
 def build_role_aware_commands(roles: Set[str]) -> List[BotCommand]:
     cmds = build_default_commands()
-
-    # Админские — только если роль admin
     if "admin" in roles:
         cmds.extend(
             [
@@ -943,11 +933,6 @@ def build_role_aware_commands(roles: Set[str]) -> List[BotCommand]:
     return cmds
 
 async def ensure_menu_for_chat(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int], chat_id: int) -> None:
-    """
-    Выставляет меню команд для указанного чата:
-      - если известен user_id — команды под роли пользователя (scope=chat)
-      - иначе — дефолтные команды
-    """
     try:
         if user_id:
             roles = db_get_user_roles(user_id)
@@ -959,7 +944,6 @@ async def ensure_menu_for_chat(context: ContextTypes.DEFAULT_TYPE, user_id: Opti
         logger.exception("ensure_menu_for_chat failed")
 
 async def set_default_commands(bot) -> None:
-    """Выставляем общий дефолтный набор команд (на всякий случай)."""
     try:
         await bot.set_my_commands(commands=build_default_commands(), scope=BotCommandScopeDefault())
     except Exception:
@@ -985,8 +969,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваши роли: {db_roles_ru(u.id)}",
         reply_markup=ReplyKeyboardRemove()
     )
-
-    # После верификации — обновляем меню команд под роли
     await ensure_menu_for_chat(context, u.id, update.effective_chat.id)
 
 # ============================================
@@ -1180,7 +1162,7 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = aggregate_rows(db_fetch_tickets_rows())
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     out_path = DATA_DIR / f"tickets_{ts}.csv"
-    write_csv(out_path=out_path, rows=rows)  # named args для читаемости
+    write_csv(out_path=out_path, rows=rows)
     with out_path.open("rb") as f:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
@@ -1277,7 +1259,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not has_group_power(user.id, group):
                 await query.answer("Недостаточно прав для действий по этой заявке.", show_alert=True)
                 return
-            # Раньше проверяли message_id и считали «устаревшим». Теперь достаточно совпадения чата.
             if query.message and (t.get("group_chat_id") != query.message.chat.id):
                 await query.answer("Это сообщение не из чата группы этой заявки.")
                 return
@@ -1417,13 +1398,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not pend or pend.get("reason_code") == "other_group":
                     await query.answer("Нет ожидающего отклонения (или выбрана маршрутизация).")
                     return
-                t["status"] = "rejected"
-                t["reject_reason_code"] = pend["reason_code"]
-                t["reject_comment"] = pend.get("comment")
+
+                # Теперь: окончательно ЗАКРЫВАЕМ заявку и уведомляем автора
+                t["status"] = "closed"
                 t["leader_id"] = user.id
                 t["leader_name"] = user.full_name
                 t["leader_decision_ts"] = iso_now()
-                t["rejected_ts"] = t.get("rejected_ts") or iso_now()
+                t["closed_ts"] = t.get("closed_ts") or iso_now()
+                # сохраняем причину/комментарий для истории
+                t["reject_reason_code"] = pend["reason_code"]
+                t["reject_comment"] = pend.get("comment")
                 t.pop("pending_reject", None)
                 TICKETS[t_id] = t
 
@@ -1431,7 +1415,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_insert_event({"event": "rejected", "ticket_id": t_id, "executor_id": pend["executor_id"], "leader_id": user.id,
                                  "group": group, "category": t["classification"]["category"], "comment": t["reject_comment"]})
                 db_upsert_ticket_snapshot(t)
-                db_touch_ticket_timestamp(t_id, "rejected_ts")
+                db_touch_ticket_timestamp(t_id, "closed_ts")
 
                 try:
                     await context.bot.edit_message_text(
@@ -1444,19 +1428,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.exception("edit group after leader approve failed")
 
+                # Уведомление автору — теперь явное "закрыта"
                 try:
                     await context.bot.send_message(
                         chat_id=t["submitter_chat_id"],
-                        text=(f"Заявка #{t_id} отклонена.\n"
-                              f"Причина: { {'not_uto':'Не к УТО','no_access':'Нет доступа к помещению'}.get(t['reject_reason_code'],'—') }\n"
+                        text=(f"Заявка #{t_id} закрыта. ❌\n"
+                              f"Причина: { {'not_uto':'Не к УТО','no_access':'Нет доступа к помещению','other_group':'К другой группе'}.get(t.get('reject_reason_code'),'—') }\n"
                               f"Комментарий: {html_escape(t.get('reject_comment') or '-', False)}"),
                         parse_mode="HTML",
                     )
                 except Exception:
-                    logger.exception("notify submitter rejected failed")
+                    logger.exception("notify submitter closed (leader approve) failed")
 
-                await audit_log(context.bot, f"❌ Rejected (leader approved) #{t_id} reason={t['reject_reason_code']}")
-                await query.answer("Отклонение согласовано.")
+                await audit_log(context.bot, f"❌ Closed by leader approve #{t_id} reason={t.get('reject_reason_code')}")
+                await query.answer("Отклонение согласовано, заявка закрыта.")
                 return
 
             if action == "leadcancel":
@@ -1562,7 +1547,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
 
-        # Обновим карточку без кнопок (ожидание решения руководителя)
         try:
             await context.bot.edit_message_text(
                 chat_id=t["group_chat_id"],
@@ -1574,7 +1558,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("edit group after pending reject failed")
 
-        # Текст руководителю
         leader_text = (
             f"⛔ Запрос на отклонение заявки #{t_id}\n"
             f"Группа: {t['classification']['group']} / Категория: {t['classification']['category']}\n"
@@ -1585,15 +1568,11 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         kb = kb_leader_choose_group(t_id) if reason == "other_group" else kb_leader_approve_or_cancel(t_id)
 
-        # Пытаемся отправить руководителям в личку (БД → ENV)
         delivered, failed = await send_to_leaders(context.bot, t["classification"]["group"], leader_text, kb)
 
-        # Если никому не доставили — фолбэк: публикуем карточку на согласование в ГРУППОВОЙ ЧАТ
         if not delivered:
             await post_leader_card_to_group(context.bot, t, leader_text, reason)
-            await update.message.reply_text(
-                "Отклонение отправлено на согласование. Карточка для руководителя опубликована в чате группы."
-            )
+            await update.message.reply_text("Отклонение отправлено на согласование. Карточка для руководителя опубликована в чате группы.")
         else:
             await update.message.reply_text("Отклонение отправлено руководителю на согласование в личные сообщения.")
 
@@ -1647,7 +1626,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         REPLY_WAIT.pop(reply_key, None)
         return
 
-    # 3) Комментарий руководителя при отмене отклонения
+    # 3) Комментарий руководителя при отмене отклонения — ИСПРАВЛЕНО
     if ctx and ctx.get("type") == "leader_cancel_comment":
         t_id = ctx["ticket_id"]
         t = TICKETS.get(t_id)
@@ -1657,10 +1636,9 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         leader_comment = text or ""
 
-        # Исполнитель, который инициировал отклонение (или текущий)
+        # Уведомление исполнителю (в ЛС)
         pend_exec = (t.get("pending_reject") or {}).get("executor_id") or t.get("executor_id")
         pend_exec_name = (t.get("pending_reject") or {}).get("executor_name") or t.get("executor_name")
-
         if pend_exec:
             try:
                 await context.bot.send_message(
@@ -1672,7 +1650,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("notify executor cancel failed")
 
-        # Публикуем комментарий руководителя в ГРУППОВОЙ ЧАТ (реплай) + КНОПКИ
+        # В ГРУППОВОЙ ЧАТ публикуем новую АКТУАЛЬНУЮ карточку-реплай с кнопками КАК У НОВОЙ ЗАЯВКИ
         try:
             msg2 = await context.bot.send_message(
                 chat_id=t["group_chat_id"],
@@ -1681,44 +1659,30 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f"Руководитель: {user_link_html(u.id, u.full_name)}\n"
                       f"Комментарий: {html_escape(leader_comment or '-', False)}"),
                 parse_mode="HTML",
-                reply_markup=kb_after_accept(t_id) if t.get("executor_id") else kb_initial(t_id),
+                reply_markup=kb_initial(t_id),   # ← всегда как у новой, без «после принятия»
             )
-            # Делаем это сообщение актуальным для кнопок
+            # Делаем ЭТО сообщение актуальным для кнопок
             t["group_message_id"] = msg2.message_id
-            TICKETS[t_id] = t
-            db_upsert_ticket_snapshot(t)
         except Exception:
             logger.exception("post leader cancel comment to group failed")
 
-        # Обновить «шапку» карточки (не обязательно, но красиво)
-        try:
-            kb = kb_after_accept(t_id) if t.get("executor_id") else kb_initial(t_id)
-            await context.bot.edit_message_text(
-                chat_id=t["group_chat_id"],
-                message_id=t["group_message_id"],
-                text=ticket_group_text({**t, "pending_reject": None}),
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-        except Exception:
-            logger.exception("edit group after leader cancel failed")
-
-        # Закрепить за исполнителем и вернуть «в работе»
-        if pend_exec:
-            t["executor_id"] = pend_exec
-            t["executor_name"] = pend_exec_name
-        t["status"] = "accepted"
-        if not t.get("accepted_ts"):
-            db_touch_ticket_timestamp(t_id, "accepted_ts")
+        # Возвращаем в очередь: снимаем исполнителя, статус queued; очищаем поля отклонения
+        t["executor_id"] = None
+        t["executor_name"] = None
+        t["status"] = "queued"
+        t["reject_reason_code"] = None
+        t["reject_comment"] = None
 
         t["leader_id"] = u.id
         t["leader_name"] = u.full_name
         t["leader_decision_ts"] = iso_now()
         t.pop("pending_reject", None)
+
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
+        # не трогаем accepted_ts; заявку повторно примут вручную
 
-        await audit_log(context.bot, f"↩️ Reject canceled by leader #{t_id}")
+        await audit_log(context.bot, f"↩️ Reject canceled by leader #{t_id} → returned to QUEUED")
         return
 
     # 4) Ответ автора на уточнение — дублируем в группу (реплай) + КНОПКИ
@@ -1736,7 +1700,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
 
-        # Обновить карточку
         try:
             kb = kb_after_accept(t_id) if (t.get("status") == "accepted" or t.get("executor_id")) else kb_initial(t_id)
             await context.bot.edit_message_text(
@@ -1749,7 +1712,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("edit group after clarify answer failed")
 
-        # Личка исполнителю
         try:
             await context.bot.send_message(
                 chat_id=info["executor_id"],
@@ -1759,7 +1721,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("send clarify answer to executor failed")
 
-        # Дублируем ответ автора в группу (реплай) + КНОПКИ
         try:
             msg2 = await context.bot.send_message(
                 chat_id=t["group_chat_id"],
@@ -1768,7 +1729,6 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=kb_after_accept(t_id) if (t.get("status") == "accepted" or t.get("executor_id")) else kb_initial(t_id),
             )
-            # Делаем это сообщение актуальным для кнопок
             t["group_message_id"] = msg2.message_id
             TICKETS[t_id] = t
             db_upsert_ticket_snapshot(t)
@@ -1802,7 +1762,6 @@ async def on_contact_button_removed(update: Update, context: ContextTypes.DEFAUL
             pass
 
 async def _post_init(app):
-    # Выставляем дефолтный список команд для всех (на случай, если клиент смотрит default scope)
     await set_default_commands(app.bot)
     logger.info("Default commands set via setMyCommands (scope=default).")
 
@@ -1827,8 +1786,6 @@ def main():
     )
 
     app = ApplicationBuilder().token(token).build()
-
-    # post_init — установим дефолтное меню команд
     app.post_init = _post_init
 
     # Команды
@@ -1860,3 +1817,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
