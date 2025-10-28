@@ -1,10 +1,9 @@
 # ============================================
 # Chat-bot v2 — SINGLE FILE (bot.py)
-# Version: v8.6.0 (2025-10-16)
-# Новое:
-# - Роль "диспетчер": есть доступ ко всем чатам/заявкам, НО без права действий по заявкам.
-# - Команда /my_chats: выдаёт инвайт-ссылки на чаты доступных групп (или chat_id, если ссылку создать нельзя).
-# - Проверки прав на действия обновлены: диспетчер больше не проходит проверки на кнопки (accept/reject/clarify/complete/lead*).
+# Version: v8.5.6 (2025-10-10)
+# Изменения относительно 8.5.5:
+# 1) Ответ автора на уточнение возвращается с активной кнопкой «Принять», если заявка не принята.
+# 2) При согласовании отклонения лидером уведомляем исполнителя в ЛС (причина + комментарий).
 # ============================================
 
 import os
@@ -124,8 +123,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     author_id INTEGER,
     author_name TEXT,
     text TEXT,
-    group_name TEXT,
-    initial_group TEXT,
+    group_name TEXT,           -- текущая группа
+    initial_group TEXT,        -- первая группа
     category TEXT,
     created_ts TEXT,
     queued_ts TEXT,
@@ -250,7 +249,7 @@ def _dynamic_update(conn: sqlite3.Connection, table: str, row: Dict[str, Any], w
     set_expr = ",".join(f"{c}=?" for c in cols)
     vals = [row.get(c) for c in cols]
     sql = f"UPDATE {table} SET {set_expr} WHERE {where_key}=?"
-    logger.warning(f"[DB DYNAMIC UPDATE] {table}: using cols(non-null)logging")
+    logger.warning(f"[DB DYNAMIC UPDATE] {table}: using cols(non-null)={cols}")
     conn.execute(sql, tuple(vals + [row[where_key]]))
 
 def db_upsert_user(telegram_user_id: int, phone: str, full_name: str, roles_csv: str) -> None:
@@ -529,23 +528,13 @@ def db_roles_ru(user_id: int) -> str:
             ru.append(r)
     return ", ".join(ru)
 
-# Разделяем права: просмотр (в том числе диспетчер) vs действия (без диспетчера)
-def has_view_power(user_id: int, group: str) -> bool:
+def has_group_power(user_id: int, group: str) -> bool:
     roles = db_get_user_roles(user_id)
     return (
         f"executor:{group}" in roles
         or f"leader:{group}" in roles
         or "dispatcher" in roles
         or "admin" in roles
-    )
-
-def has_action_power(user_id: int, group: str) -> bool:
-    roles = db_get_user_roles(user_id)
-    return (
-        f"executor:{group}" in roles
-        or f"leader:{group}" in roles
-        or "admin" in roles
-        # ВАЖНО: dispatcher НЕ включаем сюда
     )
 
 def ensure_verified_author(func):
@@ -668,7 +657,7 @@ def classify(text: str) -> Dict[str, Any]:
 
 STATUS_RU = {
     "created": "новая",
-    "queued": "в очереди",
+    "queued": "на отправке",
     "accepted": "в работе",
     "rejected": "отклонена",
     "closed": "закрыта",
@@ -735,7 +724,6 @@ def kb_for_card(t: Dict[str, Any]) -> InlineKeyboardMarkup:
     Унифицированный выбор клавиатуры для карточки:
     - Если заявка уже принята (status == accepted) или есть executor_id → показываем «После принятия»
     - Иначе → стартовая клавиатура с «Принять»
-    Замечание: диспетчер видит те же кнопки, но при нажатии получит отказ (проверка прав — позже).
     """
     if (t.get("status") == "accepted") or t.get("executor_id"):
         return kb_after_accept(t["id"])
@@ -774,7 +762,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📱 Подтвердить номер", callback_data="ui:verify")],
             [InlineKeyboardButton("📊 Экспорт Excel", callback_data="ui:export_excel"),
              InlineKeyboardButton("🧾 Экспорт CSV", callback_data="ui:export_csv")],
-            [InlineKeyboardButton("🔗 Мои чаты", callback_data="ui:my_chats")],
             [InlineKeyboardButton("ℹ️ Помощь", callback_data="ui:help")],
         ]
     )
@@ -786,14 +773,11 @@ def verify_reply_kb() -> ReplyKeyboardMarkup:
     )
 
 # ============================================
-# СЛУЖЕБНЫЕ СТРУКТУРЫ (память на процесс)
+# СЛУЖЕБНЫЕ СТРУКТУРЫ
 # ============================================
 
-# ожидание реплаев (комментарий к отклонению, вопрос на уточнение, отмена отклонения и т.п.)
 REPLY_WAIT: Dict[Tuple[int, int], Dict[str, Any]] = {}
-# ожидание ответа автора (ключ — (chat_id автора, message_id с вопросом))
 CLARIFY_AUTHOR_WAIT: Dict[Tuple[int, int], Dict[str, Any]] = {}
-# актуальные тикеты в памяти
 TICKETS: Dict[str, Dict[str, Any]] = {}
 
 # ============================================
@@ -809,7 +793,7 @@ async def send_to_group(bot, t: Dict[str, Any]) -> Optional[Message]:
         msg = await bot.send_message(
             chat_id=chat_id,
             text=ticket_group_text(t),
-            reply_markup=kb_for_card(t),   # единая логика выбора клавиатуры
+            reply_markup=kb_for_card(t),   # <— единая логика выбора клавиатуры
             parse_mode="HTML"
         )
         return msg
@@ -889,7 +873,6 @@ async def send_to_leaders(bot, group: str, text: str, kb: InlineKeyboardMarkup) 
     return delivered, failed
 
 async def post_leader_card_to_group(bot, t: Dict[str, Any], leader_text: str, reason_code: str) -> None:
-    """Если не удалось доставить лидеру в ЛС — публикуем карточку в групповом чате."""
     try:
         kb = kb_leader_choose_group(t["id"]) if reason_code == "other_group" else kb_leader_approve_or_cancel(t["id"])
         await bot.send_message(
@@ -940,7 +923,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — приветствие\n"
         "/menu, /panel — показать панель кнопок\n"
         "/verify — подтвердить номер телефона\n"
-        "/my_chats — ссылки на доступные групповые чаты\n"
         "/whoami — показать user_id, chat_id и роли\n"
         "/echo_chat_id_any — chat_id текущего чата (диагностика)\n"
         "/echo_chat_id — то же, но только для админа\n"
@@ -991,7 +973,6 @@ def build_default_commands() -> List[BotCommand]:
         BotCommand("menu", "Показать панель кнопок"),
         BotCommand("panel", "Показать панель кнопок"),
         BotCommand("verify", "Подтвердить номер телефона"),
-        BotCommand("my_chats", "Ссылки на доступные групповые чаты"),
         BotCommand("whoami", "Показать user_id, chat_id и роли"),
         BotCommand("echo_chat_id_any", "Показать chat_id текущего чата"),
         BotCommand("export_excel", "Экспорт заявок в Excel"),
@@ -1254,52 +1235,6 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"Экспорт заявок (CSV, {ts} UTC)."
         )
     await audit_log(context.bot, f"🧾 Export CSV sent ({out_path.name})")
-
-# ============================================
-# /my_chats — инвайт-ссылки на доступные групповые чаты
-# ============================================
-
-async def _invite_link_or_hint(bot, chat_id: int, title: str) -> str:
-    """
-    Пытаемся создать инвайт-ссылку. Если бот не админ/нет прав — возвращаем chat_id и подсказку.
-    """
-    try:
-        link = await bot.create_chat_invite_link(chat_id=chat_id, name=f"Автоссылка: {title}")
-        if link and getattr(link, "invite_link", None):
-            return f"• {title}: {link.invite_link}"
-    except TelegramError as e:
-        pass
-    return f"• {title}: chat_id={chat_id} (пригласительная ссылка недоступна; попросите админа выдать ссылку)"
-
-def _groups_access_for(user_id: int) -> List[str]:
-    roles = db_get_user_roles(user_id)
-    groups = []
-    if "admin" in roles or "dispatcher" in roles:
-        groups = ["СВС", "СГЭ", "ССТ"]
-    else:
-        for g in ["СВС","СГЭ","ССТ"]:
-            if f"executor:{g}" in roles or f"leader:{g}" in roles:
-                groups.append(g)
-    return groups
-
-async def my_chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    groups = _groups_access_for(u.id)
-    if not groups:
-        await update.message.reply_text("Нет доступных чатов. Проверьте роли или пройдите /verify.")
-        return
-
-    lines = []
-    for g in groups:
-        cid = get_group_chat_id(g)
-        if not cid:
-            lines.append(f"• {g}: не настроен chat_id в .env")
-            continue
-        lines.append(await _invite_link_or_hint(context.bot, cid, f"Группа {g}"))
-
-    txt = "Доступные групповые чаты:\n" + "\n".join(lines)
-    await update.message.reply_text(txt)
-    await audit_log(context.bot, f"🔗 my_chats requested by user_id={u.id}: groups={','.join(groups)}")
 # ============================================
 # ВСПОМОГАТЕЛЬНОЕ: парсер номера заявки из текста (#AB12CD34)
 # ============================================
@@ -1350,14 +1285,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("Подтверждение номера доступно только в личке с ботом: откройте диалог и нажмите /verify")
             await query.answer(); return
-        if data == "ui:my_chats":
-            # тот же функционал, что и команда /my_chats
-            class FakeMsg:  # чтобы вызывать my_chats_cmd даже из query
-                def __init__(self, update): self.message = update.effective_message
-            await my_chats_cmd(FakeMsg(update), context)
-            await query.answer(); return
 
-        # подтверждение отправки драфта в группу (только автор/админ/диспетчер может подтвердить — но диспетчер не создаёт заявки обычно)
+        # подтверждение отправки драфта в группу
         if data == "ticket_confirm":
             ticket = context.user_data.get("last_ticket")
             if not ticket:
@@ -1406,7 +1335,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await audit_log(context.bot, f"⚠️ Heuristics mistake reported by user_id={user.id if user else 'unknown'}")
             return
 
-        # Кнопки заявок
         if not data.startswith("t:"):
             await query.answer("Неизвестная команда.")
             return
@@ -1416,25 +1344,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t_id = parts[2] if len(parts) > 2 else None
         t = ensure_ticket_loaded(t_id) if t_id else None
 
-        # Проверка прав на действия по заявке
-        # Диспетчер видит карточки, но не может нажимать action-кнопки
-        if action in {"accept","reject","clarify","complete","rejchoose"}:
+        # действия исполнителя — проверим права и принадлежность чата
+        if action in {"accept","reject","clarify","complete"}:
             if not t:
                 await query.answer("Заявка не найдена (возможно, бот перезапускался).")
                 return
             group = t["classification"]["group"]
-            if not has_action_power(user.id, group):
-                # Если есть право просмотра — объясним, что режим только наблюдения
-                if has_view_power(user.id, group):
-                    await query.answer("Режим наблюдателя: действия по заявке недоступны.", show_alert=True)
-                else:
-                    await query.answer("Недостаточно прав.", show_alert=True)
+            if not has_group_power(user.id, group):
+                await query.answer("Недостаточно прав для действий по этой заявке.", show_alert=True)
                 return
             if query.message and (t.get("group_chat_id") != query.message.chat.id):
                 await query.answer("Это сообщение не из чата группы этой заявки.")
                 return
 
-        # ---- Исполнитель / действия ----
         if action == "accept":
             if t["status"] in {"accepted", "closed"}:
                 await query.answer("Уже в работе/закрыта.")
@@ -1509,7 +1431,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "clarify":
             await query.answer()
             if not t.get("executor_id"):
-                # фиксируем потенциального исполнителя, но НЕ принимаем заявку
+                # фиксируем автора вопроса как потенциального исполнителя,
+                # но это НЕ означает «принято», кнопка «Принять» должна остаться доступной
                 t["executor_id"] = user.id
                 t["executor_name"] = user.full_name
                 db_upsert_ticket_snapshot(t)
@@ -1560,16 +1483,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Заявка закрыта.")
             return
 
-        # ---- Действия руководителя ----
+        # Действия руководителя
         if action in {"leadapprove","leadcancel","leadroute"}:
             if not t:
                 await query.answer("Заявка не найдена.")
                 return
             group = t["classification"]["group"]
             roles = db_get_user_roles(user.id)
-            if not (f"leader:{group}" in roles or "admin" in roles):
-                # диспетчер и исполнитель сюда не проходят
-                await query.answer("Доступно только руководителю соответствующей группы (или администратору).", show_alert=True)
+            if not (f"leader:{group}" in roles or "dispatcher" in roles or "admin" in roles):
+                await query.answer("Только для руководителя соответствующей группы (или диспетчера/админа).", show_alert=True)
                 return
 
             if action == "leadapprove":
@@ -1594,7 +1516,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_upsert_ticket_snapshot(t)
                 db_touch_ticket_timestamp(t_id, "closed_ts")
 
-                # Обновим карточку в группе
+                # Обновляем карточку в группе
                 try:
                     await context.bot.edit_message_text(
                         chat_id=t["group_chat_id"],
@@ -1606,7 +1528,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.exception("edit group after leader approve failed")
 
-                # Уведомление автору
+                # Уведомление автору (как и было)
                 try:
                     await context.bot.send_message(
                         chat_id=t["submitter_chat_id"],
@@ -1618,10 +1540,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.exception("notify submitter closed (leader approve) failed")
 
-                # Информируем исполнителя (ЛС + в группе)
+                # НОВОЕ: Уведомляем исполнителя в ЛС и в чате группы
                 exec_id = t.get("executor_id") or pend.get("executor_id")
                 exec_name = t.get("executor_name") or pend.get("executor_name")
                 if exec_id:
+                    # ЛС
                     try:
                         await context.bot.send_message(
                             chat_id=exec_id,
@@ -1633,6 +1556,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         logger.exception("notify executor (DM) after leader approve failed")
 
+                    # В группу — отдельное сообщение (reply) с упоминанием исполнителя
                     try:
                         await context.bot.send_message(
                             chat_id=t["group_chat_id"],
@@ -1931,11 +1855,11 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = text
         t["clarify_answer"] = answer
         t["clarify_answered_ts"] = iso_now()
-        # Не меняем статус на accepted — исполнитель должен сам нажать «Принять»
+        # ВАЖНО: не меняем статус на accepted — пусть исполнитель сам нажмёт «Принять»
         TICKETS[t_id] = t
         db_upsert_ticket_snapshot(t)
 
-        # Обновляем предыдущую карточку
+        # Обновляем предыдущую карточку (если можем)
         try:
             kb = kb_after_accept(t_id) if (t.get("status") == "accepted") else kb_initial(t_id)
             await context.bot.edit_message_text(
@@ -1960,7 +1884,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("send clarify answer to executor (DM) failed")
 
-        # Отдельным сообщением в группе — стартовая клавиатура, если ещё не принято
+        # Отдельным сообщением в группе — СТАРТОВАЯ клавиатура, если ещё не принято
         try:
             is_accepted = (t.get("status") == "accepted")
             msg2 = await context.bot.send_message(
@@ -1981,7 +1905,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await audit_log(context.bot, f"📩 Clarify answered #{t_id} → delivered to executor DM and group (kb={'accepted' if t.get('status')=='accepted' else 'initial'})")
         return
 
-    # Если контекст не распознан
+    # Если сюда дошли — не распознали контекст
     await update.message.reply_text("Не удалось распознать контекст ответа. Укажите номер заявки вида #AB12CD34 в сообщении.")
     return
 
@@ -2041,7 +1965,6 @@ def main():
     app.add_handler(CommandHandler("panel", panel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("verify", verify_cmd))
-    app.add_handler(CommandHandler("my_chats", my_chats_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("echo_chat_id_any", echo_chat_id_any))
     app.add_handler(CommandHandler("echo_chat_id", echo_chat_id))  # admin-only
@@ -2066,7 +1989,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
