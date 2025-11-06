@@ -7,8 +7,6 @@
 # - Проверки прав на действия обновлены: диспетчер больше не проходит проверки на кнопки (accept/reject/clarify/complete/lead*).
 # ============================================
 
-# asdasd
-
 import os
 import io
 import csv
